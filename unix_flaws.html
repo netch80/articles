@@ -1,0 +1,341 @@
+<html>
+<head>
+<title>Unix flaws</title>
+</head>
+<body>
+<p>Here I will collect features and strangenesses in Unix and
+Unix-like systems which I suppose to be explicit bugs and flaws, not
+appeared due to principal design, but which could probably be made
+better.</p>
+<p>I shall tell immediately my disclaimer that I still suppose Unix
+world is best for me now ("all XXX sucks but this one sucks less").
+But moreso it's pity to see situation which can be described, after a
+Russian poet, "You're richer than others; you're poorer than
+yourself".</p>
+<p>This article is subject for often changes, including deep
+restructuring and refactoring. If you want to perceive it seriously,
+check for updates regularly.</p>
+
+<hr>
+
+<p><h3><center>File kernel interface</center></h3></p>
+
+<p><h4>Non-blocking mode</h4></p>
+<p>Non-blocking operation mode is set on ofile object (I use early Unix
+term - ofile is instance which is created on open() but all
+descriptiors after dup() or fork() points to the same ofile object;
+its flags are changed using fcntl with F_SETFL; two separate open()
+return different ofile objects).  This leads to a set of side effects
+when this ofile object is used simultaneously or sequentially by
+different processes. For example, a process sets nonblocking mode on
+terminal, then dies on signal; a parent process shall restore terminal
+settings, including ofile flags, before using it again. This is too
+often forgotten by programmers.</p>
+
+<p>Generally say, I suppose the most correct approach is to specify
+non-blocking operation behavior in the operation directly. The proof
+is that non-blocking mode radically changes way to write the code; the
+same code can be too seldom used for both blocking and non-blocking
+operations. This is implemented in some flavors; e.g. Linux recv() and
+send() can eat flag `MSG_DONTWAIT' which prevents this call from
+blocking. But this is too rare and non-portable.</p>
+
+<p>But it shall be explicitly said that even current problematic
+interface is much more simple and usable for sequential objects
+(sockets, pipes, serial ports, etc.) than e.g. analog in WinAPI
+which requires constructing of signaled event and/or completion
+routine, and which is more appropriate for explicit AIO operation
+(as needed for disk files and raw disks).</p>
+
+<p><h4>Unknown descriptor set</h4></p>
+
+<p>There is no standard way for process to iterate own file
+descriptors. In conjugation with dubbing the whole descriptor set on
+fork() and passing to new program via exec() (excluding some
+explicitly removed from this), this lead to situation when process
+can't know what does it carry in itself.</p>
+
+<p>Some programs try to work around this using explicit closing cycle
+(from 3 to maximal supposed value, got from getrlimit()). Good
+examples are sendmail and uucico. But this makes their start more
+slow.</p>
+
+<p>I suppose the best variant how to fix this is to have variant to
+call fcntl() with constant named similarly to F_NEXTFD as second
+argument. It shall return the smallest open descriptor larger than
+first argument, or -1 otherwise.</p>
+
+<p>Modern FreeBSD uses special call to close all descriptors with numbers
+greater than specified one. This isn't finally correct but closes the
+nearest issue I described.</p>
+
+<p><h4>First available descriptor allocation</h4></p>
+
+<p>Open() and similar operations which create new descriptor shall
+return the smallest free descriptor (this is hardcoded in Posix).
+First, this interferes with usage of descriptors 0-2 for special
+purposes (stdin, stdout, stderr) hardcoded in standard library (e.g.
+heap-management functions can write their warnings to stderr). To
+prevent possible side effects, a process shall keep descriptors 0-2
+open and safe for any write or read (the simplest way is to open
+/dev/null on them). The most dangerous situation appear in case of
+multithreaded process. According to Posix, if close() fails, it is
+unspecified whether descriptor continues to exist, or it was
+removed from the process. So, if close() failed, the thread can't
+event check reliably whether the descriptor was closed, because other
+thread can be as fast as to reuse the descriptor for a new opened
+object. And, it's impossible in multithreaded process to guarantee
+safety of operation which changes any predefined descriptor (including
+0-2); even dup2() isn't defined as safe for this operations because it
+can fail with closing of old file.</p>
+
+<p>So, in current implementation, any operation with fixed descriptors
+(including standard 0-2) shall be made when all other threads are
+stopped or don't exist. For most programs, this is limited to startup
+time.</p>
+
+<p>Comparing with Windows implementation of separate marking of file
+handles (via SetStdHandle()), I think Windows variant is much more
+good. Also it hasn't problem with undefined result of close() in case
+of error return.</p>
+
+<p><h4>Close-on-exec legacy</h4></p>
+
+<p>It's common now to add options to file descriptor creating calls
+(open(), accept(), etc.) to set FD_CLOEXEC atomically during creating.
+The goal of this is to exclude race condition between creating in one
+thread and fork+exec in another thread.</p>
+
+<p>Instead, the proper solution (but impossible now due to legacy) is
+to set this flag by default without any extra flag. If an agent needs
+to pass some descriptors through exec(), it shall drop FD_CLOEXEC
+explicitly. This would also solve problem with unknown descriptor set
+passed through exec() (see above).</p>
+
+<p><h4>Pipeline reliability</h4></p>
+
+<p>There is common method to feed a program with output of another
+program using unnamed unidirectional pipe, usually created by pipe()
+syscall. It is often presented as most distinctive example of Unix
+approach of inter-process communication.</p>
+
+<p>Two problems of this approach exist:</p>
+
+<p>1. If a pipe writer fails, and protocol doesn't suppose explicit
+mark of successful termination, the reader of this pipe can't
+distinguish whether the input data is complete or not. If the pipe
+reader is final action in script, which result check can't affect
+anything (e.g. it sent mail), script can't prevent action on
+incomplete results.</p>
+
+<p>2. There is no good way to get status of all commands in pipe.
+Comp.unix.shell FAQ lists some methods for it, but portable way is too
+cumbersome and expensive.</p>
+
+<p>So, now a script which wants to perform all actions with pipelines
+reliably shall 1) check result of all intermediate commands in quite
+cumbersome way, 2) avoid using of pipes before final actions and use
+temporary files instead (with littering temporary storage and using
+extra disk operations).</p>
+
+<p>I wish to see here a way to specify either exit status of write
+process passed by kernel along the pipe, or possibility to send some
+out-of-band mark which can be used to signal correct finish of passing
+data by pipe writer. First variant is badly compatible with multiple
+writers, second variant requires changing of all current code
+base.:(</p>
+
+<p>For multiple exit status, it's reasonable to standardize getting of
+the whole pipe exit status by calling shell, including "fast" check
+whether any non-zero status has been got.</p>
+
+<p><h4>Selecting a disk file descriptor</h4></p>
+
+<p>Select(), poll() and others allow to specify descriptor which isn't
+allowed by design to be "readable" or "writable" in usual way, it's
+for disk file (or raw disk) descriptor. Any read or write operation
+on such descriptor shall include additional information, as offset and
+length. AIO syscall set reflects this properly, unlike select().</p>
+
+<p>This is minor issue, but lack of proper documentation often
+confuses non-experienced programmer. Better variant is to treat disk
+file (raw disk) descriptor as invalid for selecting. Or at least note
+this in documentation carefully.</p>
+
+
+<p><h3><center>Other kernel interfaces</center></h3></p>
+
+<p><h4>Uncontrolled forking legacy</h4></p>
+
+<p>If a program is started using fork()+exec(), it inherits a wide and
+unpredictable bunch of characteristics from its parent, including, but
+not limited to:</p>
+<ul>
+<li>Open files and their modes.</li>
+<li>Environment content (list of variables).</li>
+<li>Resource limits.</li>
+<li>Controlling terminal.</li>
+<li>Credentials, including real, effective and shadow ones, group
+list, and possibly local extensions.</li>
+<li>Umask.</li>
+<li>Signal mask.</li>
+</ul>
+
+<p>The main problem is that each system can expand this list to its
+own local additions. One can't predict result of execution with
+uncontrolled legacy. This generally isn't problem for usual programs,
+but is huge problem for credentials gateways (suid and sgid
+executables). More and more security holes are stably found in
+them.</p>
+
+<p>The only safe approach is to improve maximal limiting of actions
+performed in credentials gateways. E.g. mail submission program (as
+`sendmail -bm') shall put file with the letter to incoming directory
+(group-writable; submission program has only sgid to needed group) and
+signal corresponding daemon to start processing. Password changer
+(`passwd') in Owl Linux TCB have only sgid to separate group which
+allows to maintain user's shadow line.</p>
+
+<p><h4>Process check</h4></p>
+
+<p>There is no reliable and portable way to check whether a process
+is alive for another process which isn't parent of first one, knowing
+only its pid or without explicit action from the first process. Also,
+parent's way to get this is destructive: if child is terminated,
+waitpid() and wait4() gathers rusage immediately. Multithreaded
+process needs special handler in a thread to send child status to
+threads which wait for it, and race condition has place here: child
+can terminate before parent registers child in supervisor thread.</p>
+
+<p>Two methods can be used to fix this. First one requires getting of
+an unique process identificator (e.g. pid + start time up to
+microseconds) and atomic actions against it (e.g. variant of kill()).
+Second one requires getting a file descriptor which internally points
+to another process, and allowing a bunch of operations against it.</p>
+
+<p><h4>Serial port interface</h4></p>
+<p>Serial port interface isn't adopted to standard RS-232
+implementations (including 8250/16550/etc.):</p>
+<ol>
+<li>Interface for direct manipulation of control lines (TIOCMSET,
+TIOCMGET, TIOCMBIS, TIOCMBIC) is undocumented everywhere.</li>
+<li>There is no way to create listener for control line change.</li>
+</ol>
+
+
+<p><h3><center>Memory handling</center></h3></p>
+
+<p>Most Unixes follow now principal design of Mach VM. Its main
+idea can be simply expressed as "RAM is disk cache" and covers
+almost all use cases. Program "text" is cache of needed pages of
+main binary file and library files (with small changed part of
+cross-library links).  Changeable data is cache of swap area (this
+part really is exception due to implementation details, but
+formally it doesn't jut out). Among with techniques as
+copy-on-write, zero-fill-on-demand, lazy commit, this allows to
+reduce memory consumption (in some cases, in order of magnitude)
+and time consumption for operations as fork.</p>
+
+<p>Reverse side of this design is inability to have exact estimation of
+consumed memory and to predict its exhaustion.</p>
+<p>Example 1. System has 100M of virtual memory; the appication
+process occupied 50M. It allocates yet another 100M... and obtains
+them successfully (due to "lazy commit"). Then it starts to write
+into this new memory... when a page is written first, it is
+committed.  When summary size of committed page exhausts 50M,
+system can't allocate virtual memory for new page, and, because it
+can't simply return failure code, it kills process
+(implementations vary in details of this killing, but general
+concept is common for all flavors).</p>
+<p>Example 2. System has 100M of virtual memory; the appication
+process occupied 80M. It forks; after fork, two processes occupy
+the same 80M (with small reducing of page catalog for the new
+process). Then, processes work separately, and each modifies pages
+which was shared between them; after this modify, page dubs and
+separate copies are created for each process. When summary size of
+all personal pages and all shared pages reach system limit (100M),
+the exhaustion occurs and some process is killed.</p>
+
+<p>There are many implementations of another approaches to memory
+handling, but generally all they fall into requiring virtual
+memory (i.e. expanding swap area) according to uncommitted
+requested space and shared pages, counted for each process
+separately.
+
+<p><h3><center>Standard shell</center></h3></p>
+
+<p><h4>Wildcard matching</h4></p>
+
+<p>Shell uses wildcard mechanisms for easy specifying of group of
+names using mask. E.g. `a*' matches all files (directories, etc.)
+which names start with `a'.<br>
+There is wildcard expression `*' to match all names except ones
+starting with `.'.<br>
+There is no expression to match all names including ones starting
+with `.' (yes, it's usual need).<br>
+There is no expression to match all names including ones starting
+with `.' but excluding `.' and `..' (yes, it's yet another usual need
+and even more important than previous one).</p>
+<p>Generally, the globbing theme needs separate description. It's
+known that using globbing in shell simplifies writing programs which
+simply iterates list of their arguments. But, there are no strong
+disadvantages against having the same globbing implemented in standard
+library and called from each program in quite simple way (if the
+program supposes a globbing can be used here, it can call library
+function for this). This also has advantage because simple list can't
+carry per-file marks. E.g. a program determine file type by default
+using its suffix; if you want to process all files in directory as mp3
+files, you can't use `-mode=mp3 *', but instead shall provide
+"inserting" into forced mode and "exiting" from it: `-force-mode=mp3 *
+-exit-force-mode'. If program processes wildcard by itself, it can use
+more simple approach and treat expansion results internally.
+<p>Another problem is that shell by default passed wildcard expression
+directly, if can't find a name which conforms to it. As a result,
+`touch *' in empty directory creates file named `*'. This is
+definitely another effect than supposed by command issuer.</p>
+<p>Modern shells try to deal with these problems. For example, bash
+supports:</p>
+<dl>
+<dt>shopt noglob</dt>
+<dd>No wildcard expansion (AKA globbing) is performed. Application
+shall deal with all wildcards directly.</dd>
+<dt>shopt nullglob</dt>
+<dd>If wildcard expression doesn't match any name, no argument is
+created in generated list. This is useful e.g. for constructions like
+`for X in *; do ... done'.</dd>
+<dt>shopt failglob (FreeBSD port extension)</dt>
+<dd>If wildcard expression doesn't match any name, shell error is
+generated and no command is called.</dd>
+</dl>
+<p>All these options fix only part of problem. For example, if one
+want to match either a* or b*, no shell support this. The closest one
+is bash with its possibility to match {a*,b*} using "brace expansion"
+as two expressions, but failglob option leads to fail on the whole
+expression even if there is match for other part. Seems this is
+problem of concrete implementation, but standard variant doesn't allow
+even such incomplete variant.</p>
+<p>Bash option `dotglob' makes `*' at begin of expression matching
+also files starting with `.'. I suppose it's much simpler to use `**'
+for this.</p>
+
+<p><h4>Non-default execfail option</h4></p>
+
+<p>Shell has standard option `-e' which causes it to fail script when
+a command which result is unchecked in this script fails in any way
+(has non-zero exit status). It isn't turned on by default.</p>
+<p>I treat its "default off" status as flaw because it's too often for
+non-experienced coder to ignore problems reported by script
+contents.</p>
+
+<p><h4>Pipe exit status</h4></p>
+
+<p>This is detailedly described above, in kernel interface
+section.</p>
+
+
+
+
+<hr>
+<p>$Id$</p>
+</body>
+</html>
